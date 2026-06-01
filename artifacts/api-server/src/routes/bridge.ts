@@ -6,7 +6,7 @@ import { convert } from "html-to-text";
 import crypto from "crypto";
 import TurndownService from "turndown";
 import axios from "axios";
-import { spawn } from "child_process";
+import { scrapeWithPlaywright, detectPlatform } from "../lib/playwrightScraper";
 
 const router = Router();
 
@@ -72,57 +72,6 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-const SCRAPER_SCRIPT = path.join(process.cwd(), "scraper", "extract_chat.py");
-const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
-
-function extractChatViaScraping(url: string): Promise<{ title: string; messages: any[] }> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      proc.kill();
-      reject(new Error("EXTRACTION_TIMEOUT"));
-    }, 40000);
-
-    const workspacePyLibs = `/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages`;
-    const existingPythonPath = process.env.PYTHONPATH || "";
-    const pythonPath = existingPythonPath.includes(workspacePyLibs)
-      ? existingPythonPath
-      : `${workspacePyLibs}:${existingPythonPath}`;
-
-    const proc = spawn(PYTHON_BIN, [SCRAPER_SCRIPT, url], {
-      env: { ...process.env, PYTHONPATH: pythonPath },
-    });
-
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
-    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-
-    proc.on("close", () => {
-      clearTimeout(timeout);
-      try {
-        const lastLine = stdout.trim().split("\n").filter(Boolean).pop() || "";
-        const result = JSON.parse(lastLine);
-        if (result.error === "CHAT_DELETED") return reject(new Error("CHAT_DELETED"));
-        if (result.error === "LOGIN_REQUIRED") {
-          // Carry suggestion through so the route can surface it
-          const err: any = new Error("LOGIN_REQUIRED");
-          err.suggestion = result.suggestion || result.message;
-          return reject(err);
-        }
-        if (result.error === "PARSING_FAILED") return resolve({ title: result.title || "Extracted Chat", messages: [] });
-        if (result.error) return reject(new Error(result.message || result.error));
-        resolve({ title: result.title || "Extracted Chat", messages: result.messages || [] });
-      } catch {
-        reject(new Error("Scrapling parser returned invalid JSON"));
-      }
-    });
-
-    proc.on("error", (err: Error) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-  });
-}
 
 async function extractChatViaAxios(url: string) {
   let data = "";
@@ -683,34 +632,41 @@ router.post("/extract", async (req: Request, res: Response) => {
     const { url } = req.body;
     if (!url) return res.status(400).json({ error: "URL is required" });
 
-    const overallTimeout = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("EXTRACTION_TIMEOUT")), 50000)
-    );
-
     let title = "Extracted Chat";
     let messages: any[] = [];
 
-    // Primary: Scrapling (Python) — browser impersonation, handles anti-bot
+    // Strategy 1: Playwright (full JS render, stealth, all platforms)
     try {
-      const result = await Promise.race([extractChatViaScraping(url), overallTimeout]) as { title: string; messages: any[] };
+      const result = await scrapeWithPlaywright(url, 45000);
       title = result.title;
       messages = result.messages;
-    } catch (scraplingErr: any) {
+    } catch (pwErr: any) {
+      // Hard errors — don't fall back, surface immediately
       if (
-        scraplingErr.message?.includes("CHAT_DELETED") ||
-        scraplingErr.message?.includes("EXTRACTION_TIMEOUT") ||
-        scraplingErr.message?.includes("LOGIN_REQUIRED") ||
-        scraplingErr.message?.includes("CLOUDFLARE_BLOCKED")
+        pwErr.message?.includes("CHAT_DELETED") ||
+        pwErr.message?.includes("LOGIN_REQUIRED") ||
+        pwErr.message?.includes("CLOUDFLARE_BLOCKED") ||
+        pwErr.message?.includes("EXTRACTION_TIMEOUT")
       ) {
-        throw scraplingErr;
+        throw pwErr;
       }
-      // Scrapling failed for another reason — fall back to axios
-      const fallbackTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("EXTRACTION_TIMEOUT")), 30000)
-      );
-      const result = await Promise.race([extractChatViaAxios(url), fallbackTimeout]) as { title: string; messages: any[] };
-      title = result.title;
-      messages = result.messages;
+      // Playwright failed for another reason — fall back to Axios + Cheerio
+      try {
+        const axiosTimeout = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("EXTRACTION_TIMEOUT")), 25000)
+        );
+        const result = await Promise.race([extractChatViaAxios(url), axiosTimeout]) as { title: string; messages: any[] };
+        title = result.title;
+        messages = result.messages;
+      } catch (axiosErr: any) {
+        if (
+          axiosErr.message?.includes("CHAT_DELETED") ||
+          axiosErr.message?.includes("EXTRACTION_TIMEOUT")
+        ) {
+          throw axiosErr;
+        }
+        // Both strategies failed — messages stays empty, platform-specific error below
+      }
     }
 
     const now = Date.now();
